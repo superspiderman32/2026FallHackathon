@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
 SIDE QUEST BOT
-Text-based IRL side-quest generator for Raspberry Pi + Waveshare SIM7600 4G HAT.
+Text-based IRL side-quest game for Raspberry Pi + Waveshare SIM7600 4G HAT.
+
+ONE quest per day. You pick the difficulty, the bot picks the quest.
 
 Friends text the Pi's SIM number:
-  BORED          -> random side quest
-  MYSTERY        -> secret GPS spot near home base (Randonautica-style)
-  DONE <proof>   -> claim XP, e.g. "DONE found a vending machine that sells eggs"
-  SKIP           -> reroll your quest (costs 5 XP)
-  XP             -> your stats + title
-  TOP            -> leaderboard
-  FEED           -> latest completed quests from the group
-  NAME <name>    -> set your display name
-  HELP           -> command list
+  BORED (or QUEST)  -> today's menu (or your current quest if you already picked)
+  EASY / MEDIUM / HARD -> lock in today's quest   (1 / 2 / 3 also work)
+  MYSTERY           -> secret GPS spot near home base (counts as the day's quest)
+  DONE <proof>      -> claim XP, e.g. "DONE baked banana bread, it slapped"
+  XP                -> your player card
+  TOP               -> leaderboard
+  FEED              -> latest completed quests from the group
+  NAME <name>       -> set your display name
+  HELP              -> command list
+
+Social quests ("meet up with another player") pick a real player from the group,
+give them a heads-up text, and pay them bonus XP when you finish.
+
+The "day" rolls over at 4 AM (see DAY_ROLLOVER_HOUR) so night owls get a fair shot.
+Make sure the Pi's timezone is right:  sudo timedatectl set-timezone America/Vancouver
 
 Setup:
   sudo apt install python3-serial
@@ -25,7 +33,7 @@ import os
 import random
 import re
 import time
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 
 import serial
 
@@ -34,51 +42,82 @@ PORT = "/dev/ttyUSB2"          # SIM7600 AT port over USB. Use "/dev/serial0" if
 BAUD = 115200
 DB_FILE = os.path.expanduser("~/sidequest_db.json")
 POLL_SECONDS = 5
-MIN_QUEST_SECONDS = 120        # can't claim a quest faster than this (anti-cheese)
-SKIP_COST = 5
+DAY_ROLLOVER_HOUR = 4          # new quests unlock at 4 AM local time
 MYSTERY_XP = 40
+MYSTERY_MIN_SECONDS = 300
 MYSTERY_RADIUS_M = 1000        # mystery spots land within this distance of home base
-HOME_BASE = None               # fallback (lat, lon) if no GPS fix, e.g. (49.2827, -123.1207)
+HOME_BASE = None               # fallback (lat, lon) if no GPS fix, e.g. (49.2667, -122.9500)
 
 # Only these numbers can play (recommended so randoms can't run up your SMS bill).
 # Leave empty to allow anyone.  Example: {"+16045551234", "+17785550000"}
 ALLOWED = set()
 
-# ---------------- QUESTS ----------------
-DIRS = ["north", "south", "east", "west", "northeast", "northwest", "southeast", "southwest"]
+# SMS segment size. Long messages are split on line breaks, not mid-word.
+SMS_LIMIT = 150
 
+# ---------------- QUESTS ----------------
+# xp = reward, min = minimum seconds before DONE is accepted (anti-cheese)
+TIERS = {
+    "EASY":   {"xp": 10, "min": 60},
+    "MEDIUM": {"xp": 25, "min": 300},
+    "HARD":   {"xp": 50, "min": 600},
+}
+
+# Accepted replies -> tier
+ALIASES = {
+    "EASY": "EASY", "E": "EASY", "1": "EASY",
+    "MEDIUM": "MEDIUM", "MED": "MEDIUM", "M": "MEDIUM", "2": "MEDIUM",
+    "HARD": "HARD", "H": "HARD", "3": "HARD",
+}
+
+# Keep each one short so it fits in a single text. {player} = another real player.
 QUESTS = {
-    10: [
-        "Compliment a stranger's fit. Genuinely. No irony.",
-        "Find a dog and rate it out of 10. (It's always 12/10.)",
-        "Take a pic of the most aesthetic leaf you can find.",
-        "Buy a snack you've never tried and give it a brutally honest review.",
-        "Listen to a random song start to finish. No skips. Rate it.",
+    "EASY": [
+        "Take a selfie with an animal. Dog, cat, duck, pigeon - all valid.",
+        "Compliment a stranger's outfit. Genuinely, no irony.",
+        "Make a drink you've never tried: fancy tea, mocktail, hot choc.",
+        "Build a 5-song playlist for a friend and text it with a note.",
+        "Dance to a full song alone like nobody's watching. Full volume.",
+        "Doodle something near you for 5 min. Pic or it didn't happen.",
+        "Try a snack you've never had and give a brutal honest review.",
+        "Find something purple and take your best photo of it.",
         "Text someone you haven't talked to in a year. Just 'hey'.",
-        "People-watch for 5 min and invent a full backstory for someone.",
-        "Find something purple within 200m.",
-        "Hydration quest: drink a full glass of water. Respect the basics.",
         "Take a photo that could be an album cover.",
+        "Learn one phrase in a new language and use it today.",
+        "Do a 10 min power tidy of one messy spot. Before/after pic.",
+        "Make a fort with blankets. Sit in it. Eat something.",
+        "Text {player} the best photo on your phone and explain it.",
     ],
-    25: [
-        "Find the weirdest vending machine or shop sign within 2km.",
-        "Walk {d}m {dir} from where you're standing. Report the first weird thing you see.",
-        "Go somewhere within a 15 min walk you've never been. Rate the vibes /10.",
-        "Find street art or a mural and recreate the pose.",
-        "Get a free sample of something. Anything.",
-        "Find the oldest-looking building nearby and make up its lore.",
-        "Film 10 sec narrating your walk like a nature documentary.",
-        "Find 3 things that are the same color. Instant photo dump.",
-        "Learn one phrase in a language you don't speak and use it today.",
-        "Walk {d}m {dir}, then {d2}m {dir2}. Whatever's there, take the main character shot.",
+    "MEDIUM": [
+        "Go to a park. Sit 20 min with your phone away. Report what you saw.",
+        "Bake something from scratch. Cookies, banana bread, anything.",
+        "Pack a picnic and eat it outside, even if it's cold.",
+        "Thrift store run: find something fun for under $5.",
+        "Hit a bookstore or library, pick a book by its cover, read chapter 1.",
+        "Cook a dish from a country you've never cooked from.",
+        "Write a real postcard or letter and actually mail it.",
+        "Try a cafe you've never been to. Chat with the barista.",
+        "Go to a playground and use the swings. No shame.",
+        "Make something with your hands: craft, clay, painting, anything.",
+        "Challenge a friend to a game (cards, mini golf, bowling). Report the winner.",
+        "Buy a fruit or veg you can't name, then figure out how to eat it.",
+        "Go on a color walk: pick a color, photograph 5 things in it.",
+        "Visit a viewpoint and take the main character shot.",
+        "Call {player} (yes, call) and plan something to do together.",
     ],
-    50: [
-        "Watch the sunset somewhere with a view. Phone away for the last 5 min.",
-        "Find a hidden gem spot nobody in the group knows. Report back.",
-        "Walk 5000 steps without opening social media.",
-        "Go to a local thing you'd normally skip: market, gig, open mic.",
-        "Reach the highest point within walking distance. Main character shot required.",
-        "Cook something from scratch you've never made before.",
+    "HARD": [
+        "Meet up with {player} IRL. Phones away for 30 min. Selfie together.",
+        "Challenge {player} to a duel: cook-off, game, or race. Text the result.",
+        "Watch the sunset from the highest spot you can reach.",
+        "Cook a 3-course meal for someone. Dessert required.",
+        "Host a game night with 3+ people. Snacks mandatory.",
+        "Day trip to a nearby town, trail, or beach you've never visited.",
+        "Go to an event you'd normally skip (open mic, gig, class). Talk to 2 strangers.",
+        "Try a new activity: climbing gym, kayak, skating, pottery class.",
+        "Do 3 random acts of kindness for strangers. Report all 3.",
+        "Learn a new skill for 1 hour straight and show off what you made.",
+        "Plan a mini adventure for you + {player}. Pick a spot, go, take pics.",
+        "Bonfire or beach hang with friends. Bring snacks, tell one story each.",
     ],
 }
 
@@ -100,15 +139,108 @@ def title(xp):
     return name
 
 
-def random_quest():
-    xp = random.choices([10, 25, 50], weights=[5, 4, 1])[0]
-    text = random.choice(QUESTS[xp]).format(
-        d=random.choice([100, 200, 300, 500]),
-        d2=random.choice([100, 200, 300]),
-        dir=random.choice(DIRS),
-        dir2=random.choice(DIRS),
+def next_level(xp):
+    for need, label in LEVELS:
+        if need > xp:
+            return need, label
+    return None
+
+
+def level_floor(xp):
+    floor = 0
+    for need, _ in LEVELS:
+        if xp >= need:
+            floor = need
+    return floor
+
+
+def xp_bar(xp):
+    nxt = next_level(xp)
+    if not nxt:
+        return "[##########] MAX"
+    lo = level_floor(xp)
+    filled = int(10 * (xp - lo) / (nxt[0] - lo))
+    return "[" + "#" * filled + "-" * (10 - filled) + "]"
+
+
+def game_day():
+    """Today's date, but the day only flips at DAY_ROLLOVER_HOUR."""
+    return (datetime.now() - timedelta(hours=DAY_ROLLOVER_HOUR)).date()
+
+
+# ---------------- SMS FORMATTING ----------------
+_ASCII_FIXES = {
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+    "\u2013": "-", "\u2014": "-", "\u2026": "...", "\u00a0": " ",
+}
+
+
+def to_ascii(text):
+    for k, v in _ASCII_FIXES.items():
+        text = text.replace(k, v)
+    return text.encode("ascii", "ignore").decode()
+
+
+def chunk(text, limit=SMS_LIMIT):
+    """Split into SMS-sized parts on line/word boundaries, tagged (1/2) if needed."""
+    if len(text) <= 160:
+        return [text]
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            cut = line.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            piece, line = line[:cut], line[cut:].lstrip()
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(piece)
+        candidate = f"{cur}\n{line}" if cur else line
+        if len(candidate) <= limit:
+            cur = candidate
+        else:
+            if cur:
+                parts.append(cur)
+            cur = line
+    if cur:
+        parts.append(cur)
+    if len(parts) > 1:
+        parts = [f"{p} ({i + 1}/{len(parts)})" for i, p in enumerate(parts)]
+    return parts
+
+
+MENU = (
+    "SIDE QUESTS\n"
+    "One quest a day. Pick your difficulty:\n"
+    "\n"
+    "EASY   +10xp\n"
+    "MEDIUM +25xp\n"
+    "HARD   +50xp\n"
+    "MYSTERY +40xp (secret spot)\n"
+    "\n"
+    "Text your pick back."
+)
+
+HELP = (
+    "COMMANDS\n"
+    "BORED = daily quest\n"
+    "EASY / MEDIUM / HARD\n"
+    "MYSTERY = secret spot\n"
+    "DONE <proof>\n"
+    "XP | TOP | FEED\n"
+    "NAME <you>"
+)
+
+
+def quest_card(q, header="TODAY'S QUEST"):
+    return (
+        f"{header}\n"
+        f"[{q['tier']} +{q['xp']}xp]\n"
+        "\n"
+        f"{q['text']}\n"
+        "\n"
+        "Text DONE + what happened."
     )
-    return {"text": text, "xp": xp, "t": time.time()}
 
 
 # ---------------- MODEM ----------------
@@ -136,9 +268,7 @@ class Modem:
         print("Modem ready. Signal:", self.cmd("AT+CSQ").strip())
 
     def send_sms(self, number, text):
-        text = text.encode("ascii", "replace").decode()  # plain SMS = ASCII only
-        for i in range(0, len(text), 160):
-            part = text[i:i + 160]
+        for part in chunk(to_ascii(text)):
             self.ser.reset_input_buffer()
             self.ser.write(f'AT+CMGS="{number}"\r'.encode())
             if ">" not in self._read_until([">"], 5):
@@ -146,7 +276,7 @@ class Modem:
                 return
             self.ser.write(part.encode() + b"\x1a")
             self._read_until(["\r\nOK\r\n", "ERROR"], 30)
-            time.sleep(1)
+            time.sleep(2)  # helps multi-part texts arrive in order
 
     def read_sms(self):
         raw = self.cmd('AT+CMGL="ALL"', timeout=10)
@@ -209,83 +339,154 @@ def get_player(db, number):
         db["players"][number] = {
             "name": "Player" + number[-4:], "xp": 0, "done": 0,
             "streak": 0, "last_day": None, "quest": None,
+            "picked_day": None, "recent": [],
         }
     return db["players"][number]
 
 
+def make_quest(db, number, p, tier):
+    """Pick a quest for this tier. Social quests grab a real partner from the group."""
+    others = [n for n in db["players"] if n != number]
+    usable = [q for q in QUESTS[tier] if "{player}" not in q or others]
+    recent = p.get("recent", [])
+    template = random.choice([q for q in usable if q not in recent] or usable)
+    p["recent"] = (recent + [template])[-8:]
+
+    partner, text = None, template
+    if "{player}" in template:
+        partner = random.choice(others)
+        text = template.format(player=db["players"][partner]["name"])
+    return {
+        "tier": tier, "text": text, "xp": TIERS[tier]["xp"],
+        "min": TIERS[tier]["min"], "t": time.time(),
+        "day": game_day().isoformat(), "partner": partner,
+    }
+
+
+def lock_in(db, number, p, q):
+    """Save the day's quest and build the replies (plus a heads-up to any partner)."""
+    p["quest"] = q
+    p["picked_day"] = q["day"]
+    out = [(number, quest_card(q))]
+    if q.get("partner"):
+        out.append((q["partner"], f"HEADS UP\n{p['name']} got a quest to meet up with you today. "
+                                  "Say yes for bonus xp!"))
+    return out
+
+
 # ---------------- COMMANDS ----------------
-HELP = ("SIDE QUEST BOT. Text: BORED = new quest, MYSTERY = secret spot, "
-        "DONE <what u found>, SKIP, XP, TOP, FEED, NAME <you>")
-
-
 def handle(db, modem, number, body):
+    """Returns a list of (phone_number, text) messages to send."""
     p = get_player(db, number)
     words = body.strip().split(maxsplit=1)
     if not words:
-        return None
-    cmd, arg = words[0].upper(), (words[1].strip() if len(words) > 1 else "")
+        return []
+    cmd = re.sub(r"[^A-Za-z0-9]", "", words[0]).upper()
+    arg = words[1].strip() if len(words) > 1 else ""
+    today = game_day().isoformat()
 
-    if cmd in ("BORED", "QUEST", "START"):
-        p["quest"] = random_quest()
-        return f"SIDE QUEST ({p['quest']['xp']}xp): {p['quest']['text']} Text DONE + proof when finished."
+    def say(text):
+        return [(number, text)]
+
+    def already_picked():
+        q = p.get("quest")
+        if q and q.get("day") == today:
+            return say(quest_card(q, "YOU ALREADY HAVE ONE"))
+        return say("QUEST DONE FOR TODAY\nNice work. Fresh menu unlocks at "
+                   f"{DAY_ROLLOVER_HOUR}am.")
+
+    if cmd in ("BORED", "QUEST", "START", "PLAY"):
+        return already_picked() if p.get("picked_day") == today else say(MENU)
+
+    if cmd in ALIASES:
+        if p.get("picked_day") == today:
+            return already_picked()
+        return lock_in(db, number, p, make_quest(db, number, p, ALIASES[cmd]))
 
     if cmd == "MYSTERY":
+        if p.get("picked_day") == today:
+            return already_picked()
         here = modem.gps()
         if not here:
-            p["quest"] = random_quest()
-            return "No GPS lock rn, so here's a regular one: " + p["quest"]["text"]
+            return say("No GPS lock rn. Try again in a minute, or pick EASY / MEDIUM / HARD.")
         lat, lon = random_point(*here, MYSTERY_RADIUS_M)
-        p["quest"] = {"text": f"Mystery spot {lat:.5f},{lon:.5f}", "xp": MYSTERY_XP, "t": time.time()}
-        return (f"MYSTERY DROP ({MYSTERY_XP}xp): maps.google.com/?q={lat:.5f},{lon:.5f} "
-                "Go see what's there. Public + safe spots only, skip if sketchy.")
+        q = {
+            "tier": "MYSTERY", "xp": MYSTERY_XP, "min": MYSTERY_MIN_SECONDS,
+            "t": time.time(), "day": today, "partner": None,
+            "text": ("Go see what's at this spot:\n"
+                     f"maps.google.com/?q={lat:.5f},{lon:.5f}\n"
+                     "Public + safe only. Bring a friend. Skip it if it feels sketchy."),
+        }
+        return lock_in(db, number, p, q)
 
     if cmd == "DONE":
         q = p.get("quest")
         if not q:
-            return "No active quest. Text BORED to get one."
-        if time.time() - q["t"] < MIN_QUEST_SECONDS:
-            return "Too fast, that's kinda sus. Actually go do it lol"
-        today = date.today().isoformat()
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
+            if p.get("picked_day") == today:
+                return say("You already finished today's quest. See you tomorrow!")
+            return say("No active quest. Text BORED to pick one.")
+        if q.get("day") != today:
+            p["quest"] = None
+            return say("That quest expired. Text BORED for today's menu.")
+        if time.time() - q["t"] < q.get("min", 60):
+            return say("Hold up, that was quick. Go do it for real, then text DONE.")
+
+        yesterday = (game_day() - timedelta(days=1)).isoformat()
         if p["last_day"] == yesterday:
             p["streak"] += 1
         elif p["last_day"] != today:
             p["streak"] = 1
         p["last_day"] = today
-        gained = q["xp"] + min(p["streak"] - 1, 5) * 2  # streak bonus up to +10
+
+        bonus = min(p["streak"] - 1, 5) * 2  # streak bonus up to +10
+        gained = q["xp"] + bonus
         old = title(p["xp"])
         p["xp"] += gained
         p["done"] += 1
         p["quest"] = None
-        db["feed"] = ([{"name": p["name"], "proof": arg[:80] or q["text"][:60]}] + db["feed"])[:20]
-        msg = f"W. +{gained}xp (streak {p['streak']} days). Total: {p['xp']}xp."
-        if title(p["xp"]) != old:
-            msg += f" LEVEL UP: you're now {title(p['xp'])}!"
-        return msg
+        db["feed"] = ([{"name": p["name"], "proof": arg[:80] or q["text"].split("\n")[0][:60]}]
+                      + db["feed"])[:20]
 
-    if cmd == "SKIP":
-        p["xp"] = max(0, p["xp"] - SKIP_COST)
-        p["quest"] = random_quest()
-        return f"Rerolled (-{SKIP_COST}xp). NEW QUEST ({p['quest']['xp']}xp): {p['quest']['text']}"
+        lines = ["QUEST COMPLETE!", f"+{gained}xp" + (f" (incl. +{bonus} streak)" if bonus else ""),
+                 f"Streak: {p['streak']} day{'s' if p['streak'] != 1 else ''}",
+                 f"Total: {p['xp']}xp"]
+        if title(p["xp"]) != old:
+            lines += ["", f"LEVEL UP! You're now {title(p['xp'])}"]
+        lines += ["", "Next quest unlocks tomorrow."]
+        out = say("\n".join(lines))
+
+        partner = db["players"].get(q.get("partner") or "")
+        if partner:
+            share = q["xp"] // 2
+            partner["xp"] += share
+            out.append((q["partner"], f"BONUS XP\n{p['name']} finished the meetup quest with you. "
+                                      f"+{share}xp! Total: {partner['xp']}xp."))
+        return out
 
     if cmd == "XP":
-        return (f"{p['name']}: {p['xp']}xp, {p['done']} quests, {p['streak']} day streak. "
-                f"Rank: {title(p['xp'])}")
+        nxt = next_level(p["xp"])
+        lines = [p["name"], f"Rank: {title(p['xp'])}", f"XP: {p['xp']}", xp_bar(p["xp"])]
+        if nxt:
+            lines.append(f"Next: {nxt[1]} in {nxt[0] - p['xp']}xp")
+        lines.append(f"Quests: {p['done']} | Streak: {p['streak']}d")
+        return say("\n".join(lines))
 
     if cmd == "TOP":
-        ranked = sorted(db["players"].values(), key=lambda r: -r["xp"])[:5]
-        return "LEADERBOARD\n" + "\n".join(f"{i+1}. {r['name']} {r['xp']}xp" for i, r in enumerate(ranked))
+        ranked = sorted(db["players"].items(), key=lambda kv: -kv[1]["xp"])[:5]
+        rows = [f"{i + 1}. {r['name']} - {r['xp']}xp" + ("  <- you" if n == number else "")
+                for i, (n, r) in enumerate(ranked)]
+        return say("LEADERBOARD\n\n" + "\n".join(rows))
 
     if cmd == "FEED":
         if not db["feed"]:
-            return "Feed's empty. Be the first. Text BORED."
-        return "\n".join(f"{e['name']}: {e['proof']}" for e in db["feed"][:3])
+            return say("Feed's empty. Be the first. Text BORED.")
+        return say("RECENT WINS\n\n" + "\n".join(f"{e['name']}: {e['proof']}" for e in db["feed"][:3]))
 
     if cmd == "NAME" and arg:
-        p["name"] = re.sub(r"[^A-Za-z0-9_ ]", "", arg)[:15] or p["name"]
-        return f"You're now {p['name']}. Text BORED to start."
+        p["name"] = re.sub(r"[^A-Za-z0-9_ ]", "", arg)[:15].strip() or p["name"]
+        return say(f"Got it, you're {p['name']}.\nText BORED to start.")
 
-    return HELP
+    return say(HELP)
 
 
 # ---------------- MAIN LOOP ----------------
@@ -301,11 +502,11 @@ def main():
                 if ALLOWED and number not in ALLOWED:
                     continue
                 print(f"<- {number}: {body}")
-                reply = handle(db, modem, number, body)
+                replies = handle(db, modem, number, body)
                 save_db(db)
-                if reply:
-                    print(f"-> {number}: {reply}")
-                    modem.send_sms(number, reply)
+                for to, text in replies:
+                    print(f"-> {to}: {text}")
+                    modem.send_sms(to, text)
         except Exception as e:
             print("error:", e)
             time.sleep(5)
