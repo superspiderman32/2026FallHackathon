@@ -5,15 +5,16 @@ Text-based IRL side-quest game for Raspberry Pi + Waveshare SIM7600 4G HAT.
 
 ONE quest per day. You pick the difficulty, the bot picks the quest.
 
-Friends text the Pi's SIM number:
+First text from a new number: intro + choose a username (required before anything else).
+Commands are only shown when someone texts HELP (or sends something unrecognised).
+
+Commands:
   BORED (or QUEST)  -> today's menu (or your current quest if you already picked)
   EASY / MEDIUM / HARD -> lock in today's quest   (1 / 2 / 3 also work)
   MYSTERY           -> secret GPS spot near home base (counts as the day's quest)
   DONE <proof>      -> claim XP, e.g. "DONE baked banana bread, it slapped"
-  XP                -> your player card
-  TOP               -> leaderboard
-  FEED              -> latest completed quests from the group
-  NAME <name>       -> set your display name
+  XP | TOP | FEED   -> stats, leaderboard, recent wins
+  NAME <name>       -> change username
   HELP              -> command list
 
 Social quests ("meet up with another player") pick a real player from the group,
@@ -182,26 +183,27 @@ def to_ascii(text):
 
 
 def chunk(text, limit=SMS_LIMIT):
-    """Split into SMS-sized parts on line/word boundaries, tagged (1/2) if needed."""
+    """Split into SMS-sized parts at word boundaries (keeping line breaks), tagged (1/2)."""
     if len(text) <= 160:
         return [text]
-    parts, cur = [], ""
-    for line in text.split("\n"):
-        while len(line) > limit:
-            cut = line.rfind(" ", 0, limit)
-            cut = cut if cut > 0 else limit
-            piece, line = line[:cut], line[cut:].lstrip()
-            if cur:
+    parts, cur, sep = [], "", ""
+    for tok in re.split(r"(\s+)", text):
+        if not tok:
+            continue
+        if tok.isspace():
+            sep = tok
+            continue
+        if cur and len(cur) + len(sep) + len(tok) > limit:
+            cut = cur.rfind("\n")
+            if cut > 0 and len(cur) - cut <= 40:  # prefer breaking between lines
+                parts.append(cur[:cut].rstrip())
+                cur = cur[cut:].lstrip("\n")
+            else:
                 parts.append(cur)
                 cur = ""
-            parts.append(piece)
-        candidate = f"{cur}\n{line}" if cur else line
-        if len(candidate) <= limit:
-            cur = candidate
-        else:
-            if cur:
-                parts.append(cur)
-            cur = line
+            sep = " " if cur else ""
+        cur = cur + sep + tok if cur else tok
+        sep = ""
     if cur:
         parts.append(cur)
     if len(parts) > 1:
@@ -209,37 +211,61 @@ def chunk(text, limit=SMS_LIMIT):
     return parts
 
 
+INTRO = (
+    "Hey, I'm Side Quest Bot!\n"
+    "\n"
+    "Each day you pick a difficulty and I give you one real-life quest "
+    "(bake something, meet a friend, selfie with an animal). "
+    "Finish it, send proof, earn XP.\n"
+    "\n"
+    "Text HELP for all commands."
+)
+
+ASK_NAME = (
+    "First, pick a username.\n"
+    "Reply with the name you want (2-15 letters or numbers)."
+)
+
 MENU = (
-    "SIDE QUESTS\n"
-    "One quest a day. Pick your difficulty:\n"
+    "Pick today's quest difficulty:\n"
     "\n"
-    "EASY   +10xp\n"
-    "MEDIUM +25xp\n"
-    "HARD   +50xp\n"
-    "MYSTERY +40xp (secret spot)\n"
+    "EASY - 10xp\n"
+    "MEDIUM - 25xp\n"
+    "HARD - 50xp\n"
+    "MYSTERY - 40xp, a secret spot near you\n"
     "\n"
-    "Text your pick back."
+    "Reply with one."
 )
 
 HELP = (
     "COMMANDS\n"
-    "BORED = daily quest\n"
-    "EASY / MEDIUM / HARD\n"
-    "MYSTERY = secret spot\n"
-    "DONE <proof>\n"
-    "XP | TOP | FEED\n"
-    "NAME <you>"
+    "\n"
+    "BORED - get today's quest\n"
+    "EASY / MEDIUM / HARD - pick a difficulty\n"
+    "MYSTERY - secret spot near you\n"
+    "DONE <what you did> - finish your quest\n"
+    "XP - your stats\n"
+    "TOP - leaderboard\n"
+    "FEED - recent wins\n"
+    "NAME <new name> - change username\n"
+    "HELP - show this list"
 )
+
+# Words that can't be used as a username (so a command never gets saved as a name).
+RESERVED = {
+    "BORED", "QUEST", "START", "PLAY", "MYSTERY", "DONE", "XP", "TOP", "FEED",
+    "NAME", "HELP", "STOP", "YES", "NO", "HI", "HELLO", "HEY",
+} | set(ALIASES)
 
 
 def quest_card(q, header="TODAY'S QUEST"):
     return (
         f"{header}\n"
-        f"[{q['tier']} +{q['xp']}xp]\n"
+        f"{q['tier']} - {q['xp']}xp\n"
         "\n"
         f"{q['text']}\n"
         "\n"
-        "Text DONE + what happened."
+        "When you're finished, reply DONE and tell me what happened."
     )
 
 
@@ -323,7 +349,11 @@ def random_point(lat, lon, radius_m):
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE) as f:
-            return json.load(f)
+            db = json.load(f)
+        for number, p in db["players"].items():
+            if p.get("name") == "Player" + number[-4:]:
+                p["name"] = None  # old auto-name: ask them to pick a username
+        return db
     return {"players": {}, "feed": []}
 
 
@@ -337,7 +367,7 @@ def save_db(db):
 def get_player(db, number):
     if number not in db["players"]:
         db["players"][number] = {
-            "name": "Player" + number[-4:], "xp": 0, "done": 0,
+            "name": None, "xp": 0, "done": 0,
             "streak": 0, "last_day": None, "quest": None,
             "picked_day": None, "recent": [],
         }
@@ -346,7 +376,7 @@ def get_player(db, number):
 
 def make_quest(db, number, p, tier):
     """Pick a quest for this tier. Social quests grab a real partner from the group."""
-    others = [n for n in db["players"] if n != number]
+    others = [n for n, r in db["players"].items() if n != number and r.get("name")]
     usable = [q for q in QUESTS[tier] if "{player}" not in q or others]
     recent = p.get("recent", [])
     template = random.choice([q for q in usable if q not in recent] or usable)
@@ -369,31 +399,66 @@ def lock_in(db, number, p, q):
     p["picked_day"] = q["day"]
     out = [(number, quest_card(q))]
     if q.get("partner"):
-        out.append((q["partner"], f"HEADS UP\n{p['name']} got a quest to meet up with you today. "
-                                  "Say yes for bonus xp!"))
+        out.append((q["partner"], f"HEADS UP\n{p['name']}'s quest today involves you! "
+                                  "If you two hang out, you both earn XP."))
     return out
+
+
+# ---------------- USERNAMES ----------------
+def clean_name(raw):
+    """Letters, numbers, underscores and single spaces only."""
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9_ ]", "", raw)).strip()
+
+
+def name_problem(db, number, name):
+    """Returns a message if the name can't be used, else None."""
+    if not 2 <= len(name) <= 15:
+        return "Usernames need 2-15 letters or numbers. Try another."
+    if name.upper() in RESERVED:
+        return f"\"{name}\" is a command word, so it can't be a username. Try another."
+    for n, other in db["players"].items():
+        if n != number and (other.get("name") or "").lower() == name.lower():
+            return f"Sorry, \"{name}\" is already taken. Try another."
+    return None
 
 
 # ---------------- COMMANDS ----------------
 def handle(db, modem, number, body):
     """Returns a list of (phone_number, text) messages to send."""
+    is_new = number not in db["players"]
     p = get_player(db, number)
-    words = body.strip().split(maxsplit=1)
-    if not words:
+    text_in = body.strip()
+    if not text_in:
         return []
+
+    def say(*texts):
+        return [(number, t) for t in texts]
+
+    # --- Step 1: everyone must choose a username before anything else ---
+    if not p.get("name"):
+        if is_new:
+            return say(INTRO, ASK_NAME)
+        attempt = clean_name(re.sub(r"^\s*name\s+", "", text_in, flags=re.I))
+        problem = name_problem(db, number, attempt)
+        if problem:
+            return say(problem)
+        p["name"] = attempt
+        return say(f"Welcome, {attempt}! You're in.", MENU)
+
+    words = text_in.split(maxsplit=1)
     cmd = re.sub(r"[^A-Za-z0-9]", "", words[0]).upper()
     arg = words[1].strip() if len(words) > 1 else ""
     today = game_day().isoformat()
 
-    def say(text):
-        return [(number, text)]
-
     def already_picked():
         q = p.get("quest")
         if q and q.get("day") == today:
-            return say(quest_card(q, "YOU ALREADY HAVE ONE"))
-        return say("QUEST DONE FOR TODAY\nNice work. Fresh menu unlocks at "
-                   f"{DAY_ROLLOVER_HOUR}am.")
+            return say(quest_card(q, "YOU ALREADY HAVE A QUEST TODAY"))
+        return say("You've finished today's quest. Nice work!\n"
+                   f"A new one unlocks at {DAY_ROLLOVER_HOUR}am.")
+
+    if cmd == "HELP":
+        return say(HELP)
 
     if cmd in ("BORED", "QUEST", "START", "PLAY"):
         return already_picked() if p.get("picked_day") == today else say(MENU)
@@ -408,14 +473,16 @@ def handle(db, modem, number, body):
             return already_picked()
         here = modem.gps()
         if not here:
-            return say("No GPS lock rn. Try again in a minute, or pick EASY / MEDIUM / HARD.")
+            return say("I can't get a GPS signal right now. "
+                       "Try again in a minute, or pick EASY, MEDIUM or HARD instead.")
         lat, lon = random_point(*here, MYSTERY_RADIUS_M)
         q = {
             "tier": "MYSTERY", "xp": MYSTERY_XP, "min": MYSTERY_MIN_SECONDS,
             "t": time.time(), "day": today, "partner": None,
             "text": ("Go see what's at this spot:\n"
                      f"maps.google.com/?q={lat:.5f},{lon:.5f}\n"
-                     "Public + safe only. Bring a friend. Skip it if it feels sketchy."),
+                     "Stick to public, safe places and bring a friend. "
+                     "Skip it if it feels sketchy."),
         }
         return lock_in(db, number, p, q)
 
@@ -423,13 +490,16 @@ def handle(db, modem, number, body):
         q = p.get("quest")
         if not q:
             if p.get("picked_day") == today:
-                return say("You already finished today's quest. See you tomorrow!")
-            return say("No active quest. Text BORED to pick one.")
+                return say("You've already finished today's quest. See you tomorrow!")
+            return say("You haven't picked a quest yet today.", MENU)
         if q.get("day") != today:
             p["quest"] = None
-            return say("That quest expired. Text BORED for today's menu.")
-        if time.time() - q["t"] < q.get("min", 60):
-            return say("Hold up, that was quick. Go do it for real, then text DONE.")
+            return say("Yesterday's quest expired. Here's a fresh start:", MENU)
+        wait = q.get("min", 60)
+        if time.time() - q["t"] < wait:
+            mins = max(1, round(wait / 60))
+            return say("That was fast! Go do the quest first, then text DONE. "
+                       f"(Give it at least {mins} min.)")
 
         yesterday = (game_day() - timedelta(days=1)).isoformat()
         if p["last_day"] == yesterday:
@@ -447,46 +517,55 @@ def handle(db, modem, number, body):
         db["feed"] = ([{"name": p["name"], "proof": arg[:80] or q["text"].split("\n")[0][:60]}]
                       + db["feed"])[:20]
 
-        lines = ["QUEST COMPLETE!", f"+{gained}xp" + (f" (incl. +{bonus} streak)" if bonus else ""),
-                 f"Streak: {p['streak']} day{'s' if p['streak'] != 1 else ''}",
-                 f"Total: {p['xp']}xp"]
+        lines = ["QUEST COMPLETE!", "",
+                 f"+{gained}xp" + (f" (includes +{bonus} streak bonus)" if bonus else ""),
+                 f"Total: {p['xp']}xp",
+                 f"Day streak: {p['streak']}"]
         if title(p["xp"]) != old:
-            lines += ["", f"LEVEL UP! You're now {title(p['xp'])}"]
-        lines += ["", "Next quest unlocks tomorrow."]
+            lines += ["", f"LEVEL UP! You're now a {title(p['xp'])}."]
+        lines += ["", f"Your next quest unlocks at {DAY_ROLLOVER_HOUR}am."]
         out = say("\n".join(lines))
 
         partner = db["players"].get(q.get("partner") or "")
         if partner:
             share = q["xp"] // 2
             partner["xp"] += share
-            out.append((q["partner"], f"BONUS XP\n{p['name']} finished the meetup quest with you. "
-                                      f"+{share}xp! Total: {partner['xp']}xp."))
+            out.append((q["partner"], f"BONUS XP\n{p['name']} finished their meetup quest with you. "
+                                      f"You earned +{share}xp! Total: {partner['xp']}xp."))
         return out
 
     if cmd == "XP":
         nxt = next_level(p["xp"])
         lines = [p["name"], f"Rank: {title(p['xp'])}", f"XP: {p['xp']}", xp_bar(p["xp"])]
         if nxt:
-            lines.append(f"Next: {nxt[1]} in {nxt[0] - p['xp']}xp")
-        lines.append(f"Quests: {p['done']} | Streak: {p['streak']}d")
+            lines.append(f"{nxt[0] - p['xp']}xp until {nxt[1]}")
+        lines += ["", f"Quests done: {p['done']}", f"Day streak: {p['streak']}"]
         return say("\n".join(lines))
 
     if cmd == "TOP":
-        ranked = sorted(db["players"].items(), key=lambda kv: -kv[1]["xp"])[:5]
-        rows = [f"{i + 1}. {r['name']} - {r['xp']}xp" + ("  <- you" if n == number else "")
+        named = [(n, r) for n, r in db["players"].items() if r.get("name")]
+        ranked = sorted(named, key=lambda kv: -kv[1]["xp"])[:5]
+        rows = [f"{i + 1}. {r['name']} - {r['xp']}xp" + ("  (you)" if n == number else "")
                 for i, (n, r) in enumerate(ranked)]
         return say("LEADERBOARD\n\n" + "\n".join(rows))
 
     if cmd == "FEED":
         if not db["feed"]:
-            return say("Feed's empty. Be the first. Text BORED.")
+            return say("No wins yet. Be the first to finish a quest!")
         return say("RECENT WINS\n\n" + "\n".join(f"{e['name']}: {e['proof']}" for e in db["feed"][:3]))
 
-    if cmd == "NAME" and arg:
-        p["name"] = re.sub(r"[^A-Za-z0-9_ ]", "", arg)[:15].strip() or p["name"]
-        return say(f"Got it, you're {p['name']}.\nText BORED to start.")
+    if cmd == "NAME":
+        if not arg:
+            return say(f"Your username is {p['name']}.\nTo change it, text NAME followed by the new name.")
+        new = clean_name(arg)
+        problem = name_problem(db, number, new)
+        if problem:
+            return say(problem)
+        p["name"] = new
+        return say(f"Done! You're now {new}.")
 
-    return say(HELP)
+    # Didn't understand: re-introduce the bot and point to HELP.
+    return say("Sorry, I didn't understand that.\n\n" + INTRO)
 
 
 # ---------------- MAIN LOOP ----------------
