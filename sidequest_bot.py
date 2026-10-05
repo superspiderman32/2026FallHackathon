@@ -11,7 +11,6 @@ Commands are only shown when someone texts HELP (or sends something unrecognised
 Commands:
   BORED (or QUEST)  -> today's menu (or your current quest if you already picked)
   EASY / MEDIUM / HARD -> lock in today's quest   (1 / 2 / 3 also work)
-  MYSTERY           -> secret GPS spot near home base (counts as the day's quest)
   DONE <proof>      -> claim XP, e.g. "DONE baked banana bread, it slapped"
   XP | TOP | FEED   -> stats, leaderboard, recent wins
   NAME <name>       -> change username
@@ -29,7 +28,6 @@ Setup:
 """
 
 import json
-import math
 import os
 import random
 import re
@@ -44,11 +42,6 @@ BAUD = 115200
 DB_FILE = os.path.expanduser("~/sidequest_db.json")
 POLL_SECONDS = 5
 DAY_ROLLOVER_HOUR = 4          # new quests unlock at 4 AM local time
-MYSTERY_XP = 40
-MYSTERY_MIN_SECONDS = 300
-MYSTERY_RADIUS_M = 1000        # mystery spots land within this distance of home base
-HOME_BASE = None               # fallback (lat, lon) if no GPS fix, e.g. (49.2667, -122.9500)
-
 # Only these numbers can play (recommended so randoms can't run up your SMS bill).
 # Leave empty to allow anyone.  Example: {"+16045551234", "+17785550000"}
 ALLOWED = set()
@@ -223,7 +216,7 @@ INTRO = (
 
 ASK_NAME = (
     "First, pick a username.\n"
-    "Reply with the name you want (2-15 letters or numbers)."
+    "Reply with the name you want (2-15 letters or numbers), like: Alex"
 )
 
 MENU = (
@@ -232,7 +225,6 @@ MENU = (
     "EASY - 10xp\n"
     "MEDIUM - 25xp\n"
     "HARD - 50xp\n"
-    "MYSTERY - 40xp, a secret spot near you\n"
     "\n"
     "Reply with one."
 )
@@ -242,18 +234,22 @@ HELP = (
     "\n"
     "BORED - get today's quest\n"
     "EASY / MEDIUM / HARD - pick a difficulty\n"
-    "MYSTERY - secret spot near you\n"
     "DONE <what you did> - finish your quest\n"
     "XP - your stats\n"
     "TOP - leaderboard\n"
     "FEED - recent wins\n"
     "NAME <new name> - change username\n"
-    "HELP - show this list"
+    "HELP - show this list\n"
+    "\n"
+    "Examples:\n"
+    "NAME Alex\n"
+    "NAME Pizza Queen\n"
+    "DONE baked banana bread"
 )
 
 # Words that can't be used as a username (so a command never gets saved as a name).
 RESERVED = {
-    "BORED", "QUEST", "START", "PLAY", "MYSTERY", "DONE", "XP", "TOP", "FEED",
+    "BORED", "QUEST", "START", "PLAY", "DONE", "XP", "TOP", "FEED",
     "NAME", "HELP", "STOP", "YES", "NO", "HI", "HELLO", "HEY",
 } | set(ALIASES)
 
@@ -289,7 +285,7 @@ class Modem:
         return self._read_until(["\r\nOK\r\n", "ERROR"], timeout)
 
     def setup(self):
-        for c in ["AT", "ATE0", "AT+CMGF=1", 'AT+CSCS="IRA"', "AT+CNMI=2,1,0,0,0", "AT+CGPS=1,1"]:
+        for c in ["AT", "ATE0", "AT+CMGF=1", 'AT+CSCS="IRA"', "AT+CNMI=2,1,0,0,0"]:
             self.cmd(c)
         print("Modem ready. Signal:", self.cmd("AT+CSQ").strip())
 
@@ -320,29 +316,6 @@ class Modem:
 
     def delete_sms(self, idx):
         self.cmd(f"AT+CMGD={idx}")
-
-    def gps(self):
-        raw = self.cmd("AT+CGPSINFO", timeout=3)
-        m = re.search(r"\+CGPSINFO: ([\d.]+),([NS]),([\d.]+),([EW])", raw)
-        if not m:
-            return HOME_BASE
-
-        def to_deg(v):
-            v = float(v)
-            deg = int(v // 100)
-            return deg + (v - deg * 100) / 60
-
-        lat = to_deg(m.group(1)) * (1 if m.group(2) == "N" else -1)
-        lon = to_deg(m.group(3)) * (1 if m.group(4) == "E" else -1)
-        return lat, lon
-
-
-def random_point(lat, lon, radius_m):
-    d = radius_m * math.sqrt(random.random())
-    b = random.uniform(0, 2 * math.pi)
-    dlat = d * math.cos(b) / 111320
-    dlon = d * math.sin(b) / (111320 * math.cos(math.radians(lat)))
-    return lat + dlat, lon + dlon
 
 
 # ---------------- GAME DB ----------------
@@ -423,7 +396,7 @@ def name_problem(db, number, name):
 
 
 # ---------------- COMMANDS ----------------
-def handle(db, modem, number, body):
+def handle(db, number, body):
     """Returns a list of (phone_number, text) messages to send."""
     is_new = number not in db["players"]
     p = get_player(db, number)
@@ -467,24 +440,6 @@ def handle(db, modem, number, body):
         if p.get("picked_day") == today:
             return already_picked()
         return lock_in(db, number, p, make_quest(db, number, p, ALIASES[cmd]))
-
-    if cmd == "MYSTERY":
-        if p.get("picked_day") == today:
-            return already_picked()
-        here = modem.gps()
-        if not here:
-            return say("I can't get a GPS signal right now. "
-                       "Try again in a minute, or pick EASY, MEDIUM or HARD instead.")
-        lat, lon = random_point(*here, MYSTERY_RADIUS_M)
-        q = {
-            "tier": "MYSTERY", "xp": MYSTERY_XP, "min": MYSTERY_MIN_SECONDS,
-            "t": time.time(), "day": today, "partner": None,
-            "text": ("Go see what's at this spot:\n"
-                     f"maps.google.com/?q={lat:.5f},{lon:.5f}\n"
-                     "Stick to public, safe places and bring a friend. "
-                     "Skip it if it feels sketchy."),
-        }
-        return lock_in(db, number, p, q)
 
     if cmd == "DONE":
         q = p.get("quest")
@@ -556,7 +511,7 @@ def handle(db, modem, number, body):
 
     if cmd == "NAME":
         if not arg:
-            return say(f"Your username is {p['name']}.\nTo change it, text NAME followed by the new name.")
+            return say(f"Your username is {p['name']}.\n\nTo change it, text NAME and your new name, like:\nNAME Pizza Queen")
         new = clean_name(arg)
         problem = name_problem(db, number, new)
         if problem:
@@ -581,7 +536,7 @@ def main():
                 if ALLOWED and number not in ALLOWED:
                     continue
                 print(f"<- {number}: {body}")
-                replies = handle(db, modem, number, body)
+                replies = handle(db, number, body)
                 save_db(db)
                 for to, text in replies:
                     print(f"-> {to}: {text}")
